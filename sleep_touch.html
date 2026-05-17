@@ -1,0 +1,740 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no, viewport-fit=cover">
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+    <meta name="theme-color" content="#080809">
+    <title>🌙 Sleep Touch</title>
+    <style>
+        :root {
+            --bg: #080809;
+        }
+
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        html,
+        body {
+            width: 100%;
+            height: 100%;
+            overflow: hidden;
+            background: var(--bg);
+            touch-action: manipulation;
+            -webkit-tap-highlight-color: transparent;
+            -webkit-user-select: none;
+            user-select: none;
+            -webkit-touch-callout: none;
+            cursor: default;
+            font-family: system-ui, -apple-system, sans-serif;
+        }
+
+        canvas {
+            display: block;
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            touch-action: none;
+        }
+
+        .hint {
+            position: fixed;
+            bottom: 40px;
+            left: 50%;
+            transform: translateX(-50%);
+            color: rgba(200, 170, 140, 0.6);
+            font-size: 13px;
+            letter-spacing: 0.04em;
+            pointer-events: none;
+            transition: opacity 1.5s ease;
+            z-index: 10;
+            text-align: center;
+        }
+
+        .hint.fading {
+            opacity: 0;
+        }
+    </style>
+</head>
+<body>
+    <canvas id="c"></canvas>
+    <div class="hint" id="hint">touch the jelly &nbsp;·&nbsp; pop the bubbles</div>
+
+    <script>
+        (function() {
+            const canvas = document.getElementById('c');
+            const ctx = canvas.getContext('2d');
+            const hint = document.getElementById('hint');
+
+            let W, H, dpr;
+            let jelly;
+            let bubbles = [];
+            let particles = [];
+            let pointer = null; // { x, y } in canvas coords
+            let draggingJelly = false;
+            let dragStartInJelly = false;
+            let audioCtx = null;
+            let hasInteracted = false;
+            const BUBBLE_COUNT = 14;
+
+            // ──────────────────────────────────────
+            // Resize
+            // ──────────────────────────────────────
+            function resize() {
+                dpr = Math.min(window.devicePixelRatio || 1, 2);
+                W = window.innerWidth;
+                H = window.innerHeight;
+                canvas.width = W * dpr;
+                canvas.height = H * dpr;
+                canvas.style.width = W + 'px';
+                canvas.style.height = H + 'px';
+                ctx.setTransform(1, 0, 0, 1, 0, 0);
+                ctx.scale(dpr, dpr);
+
+                if (jelly) {
+                    jelly.cx = W / 2;
+                    jelly.cy = H / 2;
+                    jelly.baseRadius = Math.min(W, H) * 0.18;
+                    jelly.radius = jelly.baseRadius;
+                    jelly.distortionX = 0;
+                    jelly.distortionY = 0;
+                    jelly.velX = 0;
+                    jelly.velY = 0;
+                }
+                if (bubbles.length > 0) {
+                    repositionBubbles();
+                }
+            }
+
+            function repositionBubbles() {
+                const avoidCx = W / 2;
+                const avoidCy = H / 2;
+                const avoidR = (jelly ? jelly.baseRadius : Math.min(W, H) * 0.18) + 40;
+                bubbles.forEach(b => {
+                    if (!b.popped) {
+                        let tries = 0;
+                        let nx, ny;
+                        do {
+                            nx = Math.random() * (W - 80) + 40;
+                            ny = Math.random() * (H - 80) + 40;
+                            tries++;
+                        } while (
+                            Math.hypot(nx - avoidCx, ny - avoidCy) < avoidR + b.radius &&
+                            tries < 50
+                        );
+                        b.x = nx;
+                        b.y = ny;
+                        b.baseX = nx;
+                        b.baseY = ny;
+                    }
+                });
+            }
+
+            // ──────────────────────────────────────
+            // Audio (subtle, gentle)
+            // ──────────────────────────────────────
+            function initAudio() {
+                if (!audioCtx) {
+                    try {
+                        audioCtx = new(window.AudioContext || window.webkitAudioContext)();
+                    } catch (e) {
+                        audioCtx = null;
+                    }
+                }
+                if (audioCtx && audioCtx.state === 'suspended') {
+                    audioCtx.resume();
+                }
+            }
+
+            function playPopSound() {
+                if (!audioCtx) return;
+                try {
+                    const now = audioCtx.currentTime;
+                    const gain = audioCtx.createGain();
+                    gain.gain.setValueAtTime(0.12, now);
+                    gain.gain.exponentialRampToValueAtTime(0.001, now + 0.15);
+
+                    const osc = audioCtx.createOscillator();
+                    osc.type = 'sine';
+                    osc.frequency.setValueAtTime(380, now);
+                    osc.frequency.exponentialRampToValueAtTime(160, now + 0.1);
+
+                    const filter = audioCtx.createBiquadFilter();
+                    filter.type = 'lowpass';
+                    filter.frequency.setValueAtTime(600, now);
+
+                    osc.connect(filter);
+                    filter.connect(gain);
+                    gain.connect(audioCtx.destination);
+                    osc.start(now);
+                    osc.stop(now + 0.15);
+                } catch (e) { /* silent */ }
+            }
+
+            function playSquishSound(intensity) {
+                if (!audioCtx) return;
+                try {
+                    const vol = Math.min(0.15, intensity * 0.08);
+                    const now = audioCtx.currentTime;
+                    const gain = audioCtx.createGain();
+                    gain.gain.setValueAtTime(vol, now);
+                    gain.gain.exponentialRampToValueAtTime(0.001, now + 0.35);
+
+                    const osc = audioCtx.createOscillator();
+                    osc.type = 'sine';
+                    const freq = 90 - intensity * 25;
+                    osc.frequency.setValueAtTime(freq, now);
+                    osc.frequency.exponentialRampToValueAtTime(40, now + 0.3);
+
+                    const filter = audioCtx.createBiquadFilter();
+                    filter.type = 'lowpass';
+                    filter.frequency.setValueAtTime(200, now);
+
+                    osc.connect(filter);
+                    filter.connect(gain);
+                    gain.connect(audioCtx.destination);
+                    osc.start(now);
+                    osc.stop(now + 0.35);
+                } catch (e) { /* silent */ }
+            }
+
+            // ──────────────────────────────────────
+            // Particle class (for bubble pops)
+            // ──────────────────────────────────────
+            class Particle {
+                constructor(x, y) {
+                    this.x = x;
+                    this.y = y;
+                    const angle = Math.random() * Math.PI * 2;
+                    const speed = Math.random() * 80 + 30;
+                    this.vx = Math.cos(angle) * speed;
+                    this.vy = Math.sin(angle) * speed;
+                    this.life = 1;
+                    this.decay = Math.random() * 2.5 + 1.5;
+                    this.radius = Math.random() * 4 + 2;
+                    this.hue = 30 + Math.random() * 20; // warm amber range
+                }
+                update(dt) {
+                    this.x += this.vx * dt;
+                    this.y += this.vy * dt;
+                    this.life -= this.decay * dt;
+                    this.vy += 40 * dt; // slight gravity
+                }
+                get alive() {
+                    return this.life > 0;
+                }
+                draw(ctx) {
+                    const alpha = this.life * 0.8;
+                    const r = this.radius * this.life;
+                    ctx.beginPath();
+                    ctx.arc(this.x, this.y, r, 0, Math.PI * 2);
+                    ctx.fillStyle = `hsla(${this.hue}, 70%, 65%, ${alpha})`;
+                    ctx.fill();
+                }
+            }
+
+            // ──────────────────────────────────────
+            // Bubble class
+            // ──────────────────────────────────────
+            class Bubble {
+                constructor(x, y, radius) {
+                    this.x = x;
+                    this.y = y;
+                    this.baseX = x;
+                    this.baseY = y;
+                    this.radius = radius || Math.random() * 14 + 12;
+                    this.popped = false;
+                    this.popTimer = 0;
+                    this.regenerateDelay = Math.random() * 5 + 3;
+                    // Floating animation params
+                    this.floatAmpX = Math.random() * 25 + 8;
+                    this.floatAmpY = Math.random() * 20 + 5;
+                    this.floatFreqX = Math.random() * 0.6 + 0.3;
+                    this.floatFreqY = Math.random() * 0.5 + 0.4;
+                    this.floatPhaseX = Math.random() * Math.PI * 2;
+                    this.floatPhaseY = Math.random() * Math.PI * 2;
+                    this.hue = 28 + Math.random() * 18;
+                }
+
+                update(dt, time) {
+                    if (this.popped) {
+                        this.popTimer += dt;
+                        if (this.popTimer >= this.regenerateDelay) {
+                            this.regenerate();
+                        }
+                        return;
+                    }
+                    // Gentle float
+                    this.x = this.baseX + Math.sin(time * this.floatFreqX + this.floatPhaseX) * this.floatAmpX;
+                    this.y = this.baseY + Math.cos(time * this.floatFreqY + this.floatPhaseY) * this.floatAmpY;
+                }
+
+                regenerate() {
+                    this.popped = false;
+                    this.popTimer = 0;
+                    this.regenerateDelay = Math.random() * 6 + 3;
+                    // New random position, avoiding jelly center
+                    const avoidCx = W / 2;
+                    const avoidCy = H / 2;
+                    const avoidR = (jelly ? jelly.baseRadius : Math.min(W, H) * 0.18) + 45;
+                    let tries = 0;
+                    let nx, ny;
+                    do {
+                        nx = Math.random() * (W - 80) + 40;
+                        ny = Math.random() * (H - 80) + 40;
+                        tries++;
+                    } while (Math.hypot(nx - avoidCx, ny - avoidCy) < avoidR + this.radius && tries < 60);
+                    this.x = nx;
+                    this.y = ny;
+                    this.baseX = nx;
+                    this.baseY = ny;
+                    this.radius = Math.random() * 14 + 12;
+                    this.floatAmpX = Math.random() * 25 + 8;
+                    this.floatAmpY = Math.random() * 20 + 5;
+                    this.floatFreqX = Math.random() * 0.6 + 0.3;
+                    this.floatFreqY = Math.random() * 0.5 + 0.4;
+                    this.floatPhaseX = Math.random() * Math.PI * 2;
+                    this.floatPhaseY = Math.random() * Math.PI * 2;
+                }
+
+                pop(particlesArray) {
+                    if (this.popped) return;
+                    this.popped = true;
+                    this.popTimer = 0;
+                    // Spawn particles
+                    const count = Math.floor(Math.random() * 8) + 6;
+                    for (let i = 0; i < count; i++) {
+                        particlesArray.push(new Particle(this.x, this.y));
+                    }
+                    playPopSound();
+                }
+
+                contains(px, py) {
+                    if (this.popped) return false;
+                    return Math.hypot(px - this.x, py - this.y) < this.radius + 6;
+                }
+
+                draw(ctx) {
+                    if (this.popped) return;
+                    const r = this.radius;
+                    // Outer glow
+                    const glowGrad = ctx.createRadialGradient(this.x, this.y, r * 0.5, this.x, this.y, r * 2.2);
+                    glowGrad.addColorStop(0, `hsla(${this.hue}, 60%, 60%, 0.25)`);
+                    glowGrad.addColorStop(1, 'transparent');
+                    ctx.beginPath();
+                    ctx.arc(this.x, this.y, r * 2.2, 0, Math.PI * 2);
+                    ctx.fillStyle = glowGrad;
+                    ctx.fill();
+
+                    // Main body
+                    const bodyGrad = ctx.createRadialGradient(this.x - r * 0.25, this.y - r * 0.3, r * 0.1, this.x, this.y,
+                    r);
+                    bodyGrad.addColorStop(0, `hsla(${this.hue}, 55%, 78%, 0.9)`);
+                    bodyGrad.addColorStop(0.6, `hsla(${this.hue}, 60%, 55%, 0.75)`);
+                    bodyGrad.addColorStop(1, `hsla(${this.hue}, 50%, 35%, 0.5)`);
+                    ctx.beginPath();
+                    ctx.arc(this.x, this.y, r, 0, Math.PI * 2);
+                    ctx.fillStyle = bodyGrad;
+                    ctx.fill();
+
+                    // Highlight dot
+                    const hlX = this.x - r * 0.28;
+                    const hlY = this.y - r * 0.32;
+                    const hlR = r * 0.22;
+                    const hlGrad = ctx.createRadialGradient(hlX, hlY, 0, hlX, hlY, hlR);
+                    hlGrad.addColorStop(0, 'rgba(255,240,220,0.85)');
+                    hlGrad.addColorStop(1, 'rgba(255,220,180,0)');
+                    ctx.beginPath();
+                    ctx.arc(hlX, hlY, hlR, 0, Math.PI * 2);
+                    ctx.fillStyle = hlGrad;
+                    ctx.fill();
+                }
+            }
+
+            // ──────────────────────────────────────
+            // Jelly class
+            // ──────────────────────────────────────
+            class Jelly {
+                constructor(cx, cy, radius) {
+                    this.cx = cx;
+                    this.cy = cy;
+                    this.baseRadius = radius;
+                    this.radius = radius;
+                    this.distortionX = 0;
+                    this.distortionY = 0;
+                    this.velX = 0;
+                    this.velY = 0;
+                    this.breathPhase = Math.random() * Math.PI * 2;
+                    this.stiffness = 0.025; // spring constant
+                    this.damping = 0.12; // damping factor
+                    this.hue = 30;
+                }
+
+                update(dt, time, isDragging, pointerX, pointerY) {
+                    if (isDragging && pointerX !== null) {
+                        // Calculate desired distortion
+                        const dx = pointerX - this.cx;
+                        const dy = pointerY - this.cy;
+                        const dist = Math.hypot(dx, dy);
+                        const maxDist = this.baseRadius * 1.6;
+                        const clampedDist = Math.min(dist, maxDist);
+                        const angle = Math.atan2(dy, dx);
+                        const targetDX = Math.cos(angle) * clampedDist;
+                        const targetDY = Math.sin(angle) * clampedDist;
+
+                        // Smoothly move distortion toward target
+                        const smoothFactor = 0.35;
+                        this.distortionX += (targetDX - this.distortionX) * smoothFactor;
+                        this.distortionY += (targetDY - this.distortionY) * smoothFactor;
+                        this.velX = (targetDX - this.distortionX) * 0.5;
+                        this.velY = (targetDY - this.distortionY) * 0.5;
+                    } else {
+                        // Spring back to zero
+                        const springForceX = -this.stiffness * this.distortionX;
+                        const springForceY = -this.stiffness * this.distortionY;
+                        const dampForceX = -this.damping * this.velX;
+                        const dampForceY = -this.damping * this.velY;
+
+                        this.velX += (springForceX + dampForceX) * dt * 60;
+                        this.velY += (springForceY + dampForceY) * dt * 60;
+                        this.distortionX += this.velX * dt * 60;
+                        this.distortionY += this.velY * dt * 60;
+
+                        // Clamp tiny values to zero
+                        if (Math.abs(this.distortionX) < 0.3 && Math.abs(this.velX) < 0.3) {
+                            this.distortionX = 0;
+                            this.velX = 0;
+                        }
+                        if (Math.abs(this.distortionY) < 0.3 && Math.abs(this.velY) < 0.3) {
+                            this.distortionY = 0;
+                            this.velY = 0;
+                        }
+                    }
+
+                    // Breathing when idle
+                    if (!isDragging && Math.abs(this.distortionX) < 1 && Math.abs(this.distortionY) < 1) {
+                        this.breathPhase += dt * 0.7;
+                        const breathFactor = 1 + Math.sin(this.breathPhase) * 0.04;
+                        this.radius = this.baseRadius * breathFactor;
+                    } else {
+                        this.radius += (this.baseRadius - this.radius) * 0.08;
+                    }
+                }
+
+                getDistortionMagnitude() {
+                    return Math.hypot(this.distortionX, this.distortionY);
+                }
+
+                contains(px, py) {
+                    // Check with some extra margin around the jelly
+                    const dx = px - this.cx;
+                    const dy = py - this.cy;
+                    const dist = Math.hypot(dx, dy);
+                    // Use baseRadius + some padding for touch detection
+                    return dist < this.baseRadius + 25;
+                }
+
+                draw(ctx) {
+                    const cx = this.cx;
+                    const cy = this.cy;
+                    const r = this.radius;
+                    const dx = this.distortionX;
+                    const dy = this.distortionY;
+                    const distMag = Math.hypot(dx, dy);
+                    const angle = distMag > 0.5 ? Math.atan2(dy, dx) : 0;
+                    const stretchFactor = distMag / this.baseRadius;
+
+                    // Draw the jelly as a deformed shape
+                    const numPoints = 64;
+                    const points = [];
+
+                    for (let i = 0; i < numPoints; i++) {
+                        const a = (i / numPoints) * Math.PI * 2;
+                        // Base radius with subtle wobble based on distortion direction
+                        const dotProduct = Math.cos(a - angle);
+                        // Stretch in the direction of distortion, compress perpendicular
+                        const stretch = 1 + dotProduct * stretchFactor * 0.6;
+                        // Slight compression on the opposite side
+                        const compress = 1 - Math.max(0, -dotProduct) * stretchFactor * 0.25;
+                        const rr = r * stretch * compress;
+                        points.push({
+                            x: cx + Math.cos(a) * rr,
+                            y: cy + Math.sin(a) * rr,
+                        });
+                    }
+
+                    // Outer glow
+                    const glowGrad = ctx.createRadialGradient(cx, cy, r * 0.7, cx, cy, r * 1.9);
+                    glowGrad.addColorStop(0, `hsla(${this.hue}, 65%, 55%, 0.3)`);
+                    glowGrad.addColorStop(0.5, `hsla(${this.hue}, 60%, 40%, 0.1)`);
+                    glowGrad.addColorStop(1, 'transparent');
+                    ctx.beginPath();
+                    ctx.arc(cx, cy, r * 1.9, 0, Math.PI * 2);
+                    ctx.fillStyle = glowGrad;
+                    ctx.fill();
+
+                    // Main jelly body
+                    ctx.beginPath();
+                    ctx.moveTo(points[0].x, points[0].y);
+                    for (let i = 0; i < points.length; i++) {
+                        const p0 = points[i];
+                        const p1 = points[(i + 1) % points.length];
+                        const cpX = (p0.x + p1.x) / 2;
+                        const cpY = (p0.y + p1.y) / 2;
+                        ctx.quadraticCurveTo(p0.x, p0.y, cpX, cpY);
+                    }
+                    ctx.closePath();
+
+                    // Body gradient (translucent amber)
+                    const bodyGrad = ctx.createRadialGradient(
+                        cx - r * 0.2 + dx * 0.3,
+                        cy - r * 0.25 + dy * 0.3,
+                        r * 0.15,
+                        cx,
+                        cy,
+                        r * 1.05
+                    );
+                    bodyGrad.addColorStop(0, `hsla(${this.hue}, 60%, 72%, 0.85)`);
+                    bodyGrad.addColorStop(0.5, `hsla(${this.hue}, 65%, 55%, 0.7)`);
+                    bodyGrad.addColorStop(0.85, `hsla(${this.hue}, 55%, 35%, 0.5)`);
+                    bodyGrad.addColorStop(1, `hsla(${this.hue}, 50%, 22%, 0.3)`);
+                    ctx.fillStyle = bodyGrad;
+                    ctx.fill();
+
+                    // Subtle inner shadow at bottom
+                    const shadowGrad = ctx.createRadialGradient(
+                        cx + r * 0.1,
+                        cy + r * 0.35,
+                        r * 0.2,
+                        cx,
+                        cy,
+                        r * 0.9
+                    );
+                    shadowGrad.addColorStop(0, 'transparent');
+                    shadowGrad.addColorStop(0.7, 'rgba(0,0,0,0.08)');
+                    shadowGrad.addColorStop(1, 'rgba(0,0,0,0.2)');
+                    ctx.beginPath();
+                    ctx.moveTo(points[0].x, points[0].y);
+                    for (let i = 0; i < points.length; i++) {
+                        const p0 = points[i];
+                        const p1 = points[(i + 1) % points.length];
+                        const cpX = (p0.x + p1.x) / 2;
+                        const cpY = (p0.y + p1.y) / 2;
+                        ctx.quadraticCurveTo(p0.x, p0.y, cpX, cpY);
+                    }
+                    ctx.closePath();
+                    ctx.fillStyle = shadowGrad;
+                    ctx.fill();
+
+                    // Specular highlight
+                    const hlX = cx - r * 0.28 + dx * 0.25;
+                    const hlY = cy - r * 0.32 + dy * 0.2;
+                    const hlRX = r * 0.38;
+                    const hlRY = r * 0.22;
+                    const hlAngle = -0.3 + angle * 0.3;
+                    ctx.save();
+                    ctx.translate(hlX, hlY);
+                    ctx.rotate(hlAngle);
+                    const hlGrad = ctx.createRadialGradient(0, 0, 0, 0, 0, hlRX);
+                    hlGrad.addColorStop(0, 'rgba(255,245,225,0.7)');
+                    hlGrad.addColorStop(0.5, 'rgba(255,235,210,0.3)');
+                    hlGrad.addColorStop(1, 'rgba(255,220,180,0)');
+                    ctx.beginPath();
+                    ctx.ellipse(0, 0, hlRX, hlRY, 0, 0, Math.PI * 2);
+                    ctx.fillStyle = hlGrad;
+                    ctx.fill();
+                    ctx.restore();
+
+                    // Tiny secondary highlight
+                    const hl2X = cx + r * 0.15 + dx * 0.1;
+                    const hl2Y = cy - r * 0.4 + dy * 0.15;
+                    const hl2R = r * 0.12;
+                    const hl2Grad = ctx.createRadialGradient(hl2X, hl2Y, 0, hl2X, hl2Y, hl2R);
+                    hl2Grad.addColorStop(0, 'rgba(255,240,220,0.5)');
+                    hl2Grad.addColorStop(1, 'rgba(255,220,180,0)');
+                    ctx.beginPath();
+                    ctx.arc(hl2X, hl2Y, hl2R, 0, Math.PI * 2);
+                    ctx.fillStyle = hl2Grad;
+                    ctx.fill();
+                }
+            }
+
+            // ──────────────────────────────────────
+            // Initialize
+            // ──────────────────────────────────────
+            function init() {
+                resize();
+                const jRadius = Math.min(W, H) * 0.18;
+                jelly = new Jelly(W / 2, H / 2, jRadius);
+
+                bubbles = [];
+                const avoidCx = W / 2;
+                const avoidCy = H / 2;
+                const avoidR = jRadius + 40;
+                for (let i = 0; i < BUBBLE_COUNT; i++) {
+                    let bx, by;
+                    let tries = 0;
+                    do {
+                        bx = Math.random() * (W - 80) + 40;
+                        by = Math.random() * (H - 80) + 40;
+                        tries++;
+                    } while (Math.hypot(bx - avoidCx, by - avoidCy) < avoidR + 18 && tries < 60);
+                    bubbles.push(new Bubble(bx, by));
+                }
+                particles = [];
+            }
+
+            // ──────────────────────────────────────
+            // Event handling
+            // ──────────────────────────────────────
+            function getEventPos(e) {
+                if (e.touches && e.touches.length > 0) {
+                    return { x: e.touches[0].clientX, y: e.touches[0].clientY };
+                }
+                if (e.changedTouches && e.changedTouches.length > 0) {
+                    return { x: e.changedTouches[0].clientX, y: e.changedTouches[0].clientY };
+                }
+                return { x: e.clientX, y: e.clientY };
+            }
+
+            function handleDown(e) {
+                e.preventDefault();
+                initAudio();
+                if (!hasInteracted) {
+                    hasInteracted = true;
+                    hint.classList.add('fading');
+                    setTimeout(() => { hint.remove(); }, 1600);
+                }
+                const pos = getEventPos(e);
+                pointer = { x: pos.x, y: pos.y };
+
+                // Check jelly first
+                if (jelly.contains(pos.x, pos.y)) {
+                    draggingJelly = true;
+                    dragStartInJelly = true;
+                } else {
+                    draggingJelly = false;
+                    dragStartInJelly = false;
+                    // Check bubbles
+                    for (let i = bubbles.length - 1; i >= 0; i--) {
+                        if (bubbles[i].contains(pos.x, pos.y)) {
+                            bubbles[i].pop(particles);
+                            break;
+                        }
+                    }
+                }
+            }
+
+            function handleMove(e) {
+                e.preventDefault();
+                const pos = getEventPos(e);
+                pointer = { x: pos.x, y: pos.y };
+
+                if (draggingJelly) {
+                    // Update jelly distortion via the update loop
+                } else if (!dragStartInJelly && pointer) {
+                    // Check if we're hovering over a bubble (for potential pop on next tap)
+                    // No continuous action needed here; pop happens on down
+                }
+            }
+
+            function handleUp(e) {
+                e.preventDefault();
+                if (draggingJelly) {
+                    const mag = jelly.getDistortionMagnitude();
+                    if (mag > 8) {
+                        playSquishSound(mag / jelly.baseRadius);
+                    }
+                }
+                draggingJelly = false;
+                dragStartInJelly = false;
+                pointer = null;
+            }
+
+            function handleCancel(e) {
+                draggingJelly = false;
+                dragStartInJelly = false;
+                pointer = null;
+            }
+
+            canvas.addEventListener('touchstart', handleDown, { passive: false });
+            canvas.addEventListener('touchmove', handleMove, { passive: false });
+            canvas.addEventListener('touchend', handleUp, { passive: false });
+            canvas.addEventListener('touchcancel', handleCancel, { passive: false });
+            canvas.addEventListener('mousedown', handleDown);
+            canvas.addEventListener('mousemove', handleMove);
+            canvas.addEventListener('mouseup', handleUp);
+            canvas.addEventListener('mouseleave', handleCancel);
+            window.addEventListener('resize', () => {
+                resize();
+                repositionBubbles();
+            });
+
+            // Prevent scrolling on the whole page
+            document.addEventListener('touchmove', function(e) {
+                if (e.target === canvas || canvas.contains(e.target)) {
+                    e.preventDefault();
+                }
+            }, { passive: false });
+
+            // ──────────────────────────────────────
+            // Main loop
+            // ──────────────────────────────────────
+            let lastTime = performance.now();
+
+            function loop(time) {
+                let dt = (time - lastTime) / 1000;
+                if (dt <= 0) dt = 0.016;
+                if (dt > 0.2) dt = 0.2; // Cap to avoid jumps
+                lastTime = time;
+
+                // Update jelly
+                const px = (draggingJelly && pointer) ? pointer.x : null;
+                const py = (draggingJelly && pointer) ? pointer.y : null;
+                jelly.update(dt, time, draggingJelly, px, py);
+
+                // Update bubbles
+                bubbles.forEach(b => b.update(dt, time));
+
+                // Update particles
+                particles.forEach(p => p.update(dt));
+                particles = particles.filter(p => p.alive);
+
+                // Clear
+                ctx.clearRect(0, 0, W, H);
+
+                // Draw subtle ambient vignette
+                const vignetteGrad = ctx.createRadialGradient(W / 2, H / 2, Math.min(W, H) * 0.5, W / 2, H / 2, Math.max(W,
+                    H) * 0.75);
+                vignetteGrad.addColorStop(0, 'transparent');
+                vignetteGrad.addColorStop(1, 'rgba(0,0,0,0.4)');
+                ctx.fillStyle = vignetteGrad;
+                ctx.fillRect(0, 0, W, H);
+
+                // Draw bubbles (behind jelly)
+                bubbles.forEach(b => b.draw(ctx));
+
+                // Draw particles
+                particles.forEach(p => p.draw(ctx));
+
+                // Draw jelly
+                jelly.draw(ctx);
+
+                requestAnimationFrame(loop);
+            }
+
+            // ──────────────────────────────────────
+            // Start
+            // ──────────────────────────────────────
+            init();
+            requestAnimationFrame(loop);
+        })();
+    </script>
+</body>
+</html>
